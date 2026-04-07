@@ -3,77 +3,18 @@ import json
 import cv2
 import numpy as np
 
-# =========================================================
-# FIXED OBJECT DETECTION PROGRAM
-# Uses scan_images/front.jpg, right.jpg, back.jpg, left.jpg
-# Saves:
-#   results/local_object_3x3.txt
-#   results/object_results.json
-#   debug_objects/*.jpg
-#
-# O = obstacle = white box with red X
-# T = target   = white box with black X
-# E = empty
-# ? = unknown
-# =========================================================
-
 SCAN_DIR = "scan_images"
-DEBUG_DIR = "debug_objects"
+DEBUG_DIR = "debug_tiles"
 RESULTS_DIR = "results"
 
 HEADINGS = ["front", "right", "back", "left"]
 
-# ---------------------------------------------------------
-# ROI / slot layout
-# ---------------------------------------------------------
-ROI_TOP_FRAC = 0.34
-ROI_BOT_FRAC = 0.94
+# kept same general structure / mapping style
+ROI_TOP_FRAC = 0.55
+ROI_BOT_FRAC = 0.95
 
 SLOT_PAD_X_FRAC = 0.03
 SLOT_PAD_Y_FRAC = 0.06
-
-# ---------------------------------------------------------
-# FIXED PARAMETERS FROM YOUR SCREENSHOT
-# ---------------------------------------------------------
-
-WHITE_S_MAX = 184
-WHITE_V_MIN = 170
-MIN_WHITE_AREA = 2500
-
-RED_H1_MAX = 24
-RED_H2_MIN = 15
-RED_S_MIN = 47
-RED_V_MIN = 0
-
-BLUE_H_MIN = 147
-BLUE_H_MAX = 174
-BLUE_S_MIN = 0
-BLUE_V_MIN = 0
-
-BLACK_V_MAX = 196
-
-RED_RATIO_TH = 0.33
-BLACK_RATIO_TH = 0.26
-BLUE_RATIO_MAX = 0.78
-RB_MARGIN = 1.30
-TB_MARGIN = 1.30
-WHITE_RATIO_MIN = 0.18
-
-OPEN_K = 1     # screenshot showed 0, but kernel size cannot be 0
-CLOSE_K = 5
-
-# Keep your X-shape support
-CANNY1 = 40
-CANNY2 = 120
-HOUGH_TH = 30
-MIN_LINE = 8
-MAX_GAP = 40
-
-BLUR_ODD = 1
-
-MIN_RED_BLOB_AREA = 120
-MIN_BLUE_BLOB_AREA = 120
-MIN_BLACK_BLOB_AREA = 120
 
 HEADING_TO_POSITIONS = {
     "front": [(-1, +1), (0, +1), (+1, +1)],
@@ -138,194 +79,106 @@ def save_matrix_txt(path, final_grid):
             f.write(" ".join(row) + "\n")
 
 
-def remove_small_blobs(mask, min_area):
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cleaned = np.zeros_like(mask)
-    for c in cnts:
-        if cv2.contourArea(c) >= min_area:
-            cv2.drawContours(cleaned, [c], -1, 255, thickness=cv2.FILLED)
-    return cleaned
+def center_crop(img, frac=0.50):
+    h, w = img.shape[:2]
+    y0 = int((1.0 - frac) * 0.5 * h)
+    y1 = int(h - y0)
+    x0 = int((1.0 - frac) * 0.5 * w)
+    x1 = int(w - x0)
+    return img[y0:y1, x0:x1]
 
 
-def clean_mask(mask, open_k=1, close_k=5):
-    open_k = max(1, open_k)
-    close_k = max(1, close_k)
+def classify_color_opencv(tile_bgr):
+    if tile_bgr is None or tile_bgr.size == 0:
+        return "unknown", "?", {"reason": "empty_roi"}
 
-    if open_k % 2 == 0:
-        open_k += 1
-    if close_k % 2 == 0:
-        close_k += 1
+    roi = center_crop(tile_bgr, 0.50)
+    if roi.size == 0:
+        return "unknown", "?", {"reason": "bad_center_crop"}
 
-    kernel_open = np.ones((open_k, open_k), np.uint8)
-    kernel_close = np.ones((close_k, close_k), np.uint8)
+    roi = cv2.GaussianBlur(roi, (5, 5), 0)
 
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
-    return mask
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
 
+    H = hsv[:, :, 0]
+    S = hsv[:, :, 1]
+    V = hsv[:, :, 2]
+    A = lab[:, :, 1]
+    B = lab[:, :, 2]
 
-def detect_one_object_slot(slot_bgr):
-    if slot_bgr is None or slot_bgr.size == 0:
-        return "?", {}
+    valid = (S >= 45) & (V >= 45)
 
-    hsv = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2GRAY)
+    valid_ratio = float(np.count_nonzero(valid)) / float(valid.size)
+    if valid_ratio < 0.12:
+        return "unknown", "?", {
+            "reason": "too_little_colored_area",
+            "valid_ratio": round(valid_ratio, 4)
+        }
 
-    if BLUR_ODD > 1:
-        k = BLUR_ODD if BLUR_ODD % 2 == 1 else BLUR_ODD + 1
-        gray = cv2.GaussianBlur(gray, (k, k), 0)
+    hvals = H[valid]
+    s_mean = float(np.mean(S[valid]))
+    v_mean = float(np.mean(V[valid]))
+    h_mean = float(np.mean(hvals))
+    a_mean = float(np.mean(A[valid]))
+    b_mean = float(np.mean(B[valid]))
 
-    # -----------------------------------------------------
-    # White mask
-    # -----------------------------------------------------
-    white_mask = cv2.inRange(
-        hsv,
-        np.array([0, 0, WHITE_V_MIN], dtype=np.uint8),
-        np.array([180, WHITE_S_MAX, 255], dtype=np.uint8)
-    )
-    white_mask = clean_mask(white_mask, OPEN_K, CLOSE_K)
+    # masks by hue
+    red_mask = (((H <= 10) | (H >= 170)) & valid)
+    yellow_mask = ((H >= 18) & (H <= 38) & valid)
+    green_mask = ((H >= 40) & (H <= 90) & valid)
+    blue_mask = ((H >= 95) & (H <= 135) & valid)
+    pm_mask = ((H >= 136) & (H <= 169) & valid)
 
-    # White candidate area
-    white_cnts, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    largest_white_area = 0.0
-    if white_cnts:
-        largest_white_area = max(cv2.contourArea(c) for c in white_cnts)
-
-    # -----------------------------------------------------
-    # Red mask
-    # -----------------------------------------------------
-    lower_red1 = np.array([0, RED_S_MIN, RED_V_MIN], dtype=np.uint8)
-    upper_red1 = np.array([RED_H1_MAX, 255, 255], dtype=np.uint8)
-    lower_red2 = np.array([RED_H2_MIN, RED_S_MIN, RED_V_MIN], dtype=np.uint8)
-    upper_red2 = np.array([180, 255, 255], dtype=np.uint8)
-
-    red1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    red2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    red_mask = cv2.bitwise_or(red1, red2)
-    red_mask = clean_mask(red_mask, OPEN_K, CLOSE_K)
-    red_mask = remove_small_blobs(red_mask, MIN_RED_BLOB_AREA)
-
-    # -----------------------------------------------------
-    # Blue mask
-    # -----------------------------------------------------
-    if BLUE_H_MIN <= BLUE_H_MAX:
-        blue_mask = cv2.inRange(
-            hsv,
-            np.array([BLUE_H_MIN, BLUE_S_MIN, BLUE_V_MIN], dtype=np.uint8),
-            np.array([BLUE_H_MAX, 255, 255], dtype=np.uint8)
-        )
-    else:
-        b1 = cv2.inRange(
-            hsv,
-            np.array([BLUE_H_MIN, BLUE_S_MIN, BLUE_V_MIN], dtype=np.uint8),
-            np.array([179, 255, 255], dtype=np.uint8)
-        )
-        b2 = cv2.inRange(
-            hsv,
-            np.array([0, BLUE_S_MIN, BLUE_V_MIN], dtype=np.uint8),
-            np.array([BLUE_H_MAX, 255, 255], dtype=np.uint8)
-        )
-        blue_mask = cv2.bitwise_or(b1, b2)
-
-    blue_mask = clean_mask(blue_mask, OPEN_K, CLOSE_K)
-    blue_mask = remove_small_blobs(blue_mask, MIN_BLUE_BLOB_AREA)
-
-    # -----------------------------------------------------
-    # Black mask
-    # -----------------------------------------------------
-    v = hsv[:, :, 2]
-    black_mask = np.where(v <= BLACK_V_MAX, 255, 0).astype(np.uint8)
-    black_mask = clean_mask(black_mask, OPEN_K, CLOSE_K)
-    black_mask = remove_small_blobs(black_mask, MIN_BLACK_BLOB_AREA)
-
-    # -----------------------------------------------------
-    # Ratios
-    # -----------------------------------------------------
-    total = float(slot_bgr.shape[0] * slot_bgr.shape[1]) + 1e-6
-    white_ratio = float(np.count_nonzero(white_mask)) / total
-    red_ratio = float(np.count_nonzero(red_mask)) / total
-    blue_ratio = float(np.count_nonzero(blue_mask)) / total
-    black_ratio = float(np.count_nonzero(black_mask)) / total
-
-    # -----------------------------------------------------
-    # X-shape check
-    # -----------------------------------------------------
-    edges = cv2.Canny(gray, CANNY1, CANNY2)
-    lines = cv2.HoughLinesP(
-        edges,
-        1,
-        np.pi / 180,
-        threshold=max(1, HOUGH_TH),
-        minLineLength=max(1, MIN_LINE),
-        maxLineGap=max(0, MAX_GAP)
-    )
-
-    diag_pos = 0
-    diag_neg = 0
-
-    if lines is not None:
-        for ln in lines[:, 0]:
-            x1, y1, x2, y2 = ln
-            dx = x2 - x1
-            dy = y2 - y1
-
-            if dx == 0:
-                continue
-
-            ang = np.degrees(np.arctan2(dy, dx))
-
-            if 25 <= ang <= 65:
-                diag_pos += 1
-            elif -65 <= ang <= -25:
-                diag_neg += 1
-
-    has_x_shape = (diag_pos >= 1 and diag_neg >= 1)
-
-    metrics = {
-        "largest_white_area": round(float(largest_white_area), 1),
-        "white_ratio": round(white_ratio, 4),
-        "red_ratio": round(red_ratio, 4),
-        "blue_ratio": round(blue_ratio, 4),
-        "black_ratio": round(black_ratio, 4),
-        "diag_pos": int(diag_pos),
-        "diag_neg": int(diag_neg),
-        "has_x_shape": bool(has_x_shape),
+    ratios = {
+        "red": float(np.count_nonzero(red_mask)) / float(valid.size),
+        "yellow": float(np.count_nonzero(yellow_mask)) / float(valid.size),
+        "green": float(np.count_nonzero(green_mask)) / float(valid.size),
+        "blue": float(np.count_nonzero(blue_mask)) / float(valid.size),
+        "pm": float(np.count_nonzero(pm_mask)) / float(valid.size),
     }
 
-    # Must have a reasonable white-card candidate
-    white_ok = (
-        white_ratio >= WHITE_RATIO_MIN and
-        largest_white_area >= MIN_WHITE_AREA
-    )
+    label = "unknown"
+    ch = "?"
 
-    obstacle_ok = (
-        white_ok and
-        red_ratio >= RED_RATIO_TH and
-        blue_ratio <= BLUE_RATIO_MAX and
-        red_ratio > blue_ratio * RB_MARGIN and
-        has_x_shape
-    )
+    best_basic = max(ratios, key=ratios.get)
+    best_ratio = ratios[best_basic]
 
-    target_ok = (
-        white_ok and
-        black_ratio >= BLACK_RATIO_TH and
-        black_ratio > blue_ratio * TB_MARGIN and
-        has_x_shape
-    )
+    if best_ratio >= 0.18:
+        if best_basic == "red":
+            label, ch = "red", "R"
+        elif best_basic == "yellow":
+            label, ch = "yellow", "Y"
+        elif best_basic == "green":
+            label, ch = "green", "G"
+        elif best_basic == "blue":
+            label, ch = "blue", "B"
+        elif best_basic == "pm":
+            # separate pink vs purple using brightness + LAB B channel
+            # brighter / warmer magenta tends toward pink
+            if v_mean >= 125 or b_mean >= 145:
+                label, ch = "pink", "M"
+            else:
+                label, ch = "purple", "P"
 
-    if obstacle_ok and not target_ok:
-        return "O", metrics
+    # fallback for pink/purple if hue split was weak
+    if label == "unknown":
+        if a_mean >= 145 and b_mean >= 135 and v_mean >= 110:
+            label, ch = "pink", "M"
+        elif a_mean >= 145 and b_mean < 135:
+            label, ch = "purple", "P"
 
-    if target_ok and not obstacle_ok:
-        return "T", metrics
+    metrics = {
+        "valid_ratio": round(valid_ratio, 4),
+        "h_mean": round(h_mean, 2),
+        "s_mean": round(s_mean, 2),
+        "v_mean": round(v_mean, 2),
+        "lab_a_mean": round(a_mean, 2),
+        "lab_b_mean": round(b_mean, 2),
+        "ratios": {k: round(v, 4) for k, v in ratios.items()}
+    }
 
-    if obstacle_ok and target_ok:
-        return ("O", metrics) if red_ratio > black_ratio else ("T", metrics)
-
-    if (not white_ok) and red_ratio < RED_RATIO_TH and black_ratio < BLACK_RATIO_TH:
-        return "E", metrics
-
-    return "?", metrics
+    return label, ch, metrics
 
 
 def main():
@@ -370,38 +223,39 @@ def main():
             dbg_name = os.path.join(DEBUG_DIR, f"{heading}_slot{i}.jpg")
             cv2.imwrite(dbg_name, tile)
 
-            obj_char, metrics = detect_one_object_slot(tile)
+            label, ch, metrics = classify_color_opencv(tile)
             pos = HEADING_TO_POSITIONS[heading][i]
-            final_grid[pos] = obj_char
+            final_grid[pos] = ch
 
-            print(f"  slot {i}: object={obj_char}, saved={dbg_name}")
+            print(f"  slot {i}: label={label}, char={ch}, saved={dbg_name}")
             print(f"    metrics: {metrics}")
 
             heading_info.append({
                 "slot_index": i,
                 "pos": [pos[0], pos[1]],
-                "object": obj_char,
+                "label": label,
+                "char": ch,
                 "debug_crop": dbg_name,
                 "metrics": metrics
             })
 
         detailed[heading] = heading_info
 
-    print("\nFinal 3x3 object matrix:")
+    print("\nFinal 3x3 color matrix:")
     pretty_print_matrix(final_grid)
 
     out = {
         "center": [0, 0],
         "agent": "A",
-        "grid_objects": {
+        "grid_letters": {
             f"{c},{r}": final_grid[(c, r)]
             for (c, r) in final_grid
         },
         "per_heading": detailed
     }
 
-    json_path = os.path.join(RESULTS_DIR, "object_results.json")
-    txt_path = os.path.join(RESULTS_DIR, "local_object_3x3.txt")
+    json_path = os.path.join(RESULTS_DIR, "color_results.json")
+    txt_path = os.path.join(RESULTS_DIR, "local_color_3x3.txt")
 
     with open(json_path, "w") as f:
         json.dump(out, f, indent=2)
