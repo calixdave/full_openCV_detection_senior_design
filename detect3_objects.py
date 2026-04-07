@@ -4,7 +4,17 @@ import cv2
 import numpy as np
 
 # =========================================================
-# CONFIG
+# FIXED OBJECT DETECTION PROGRAM
+# Uses scan_images/front.jpg, right.jpg, back.jpg, left.jpg
+# Saves:
+#   results/local_object_3x3.txt
+#   results/object_results.json
+#   debug_objects/*.jpg
+#
+# O = obstacle = white box with red X
+# T = target   = white box with black X
+# E = empty
+# ? = unknown
 # =========================================================
 
 SCAN_DIR = "scan_images"
@@ -14,16 +24,18 @@ RESULTS_DIR = "results"
 HEADINGS = ["front", "right", "back", "left"]
 
 # ---------------------------------------------------------
-# Updated from your screenshot values
+# ROI / slot layout
 # ---------------------------------------------------------
-
 ROI_TOP_FRAC = 0.34
 ROI_BOT_FRAC = 0.94
 
 SLOT_PAD_X_FRAC = 0.03
 SLOT_PAD_Y_FRAC = 0.06
 
-# White / black / red thresholds from screenshot
+# ---------------------------------------------------------
+# FIXED PARAMETERS FROM YOUR SCREENSHOT
+# ---------------------------------------------------------
+
 WHITE_S_MAX = 184
 WHITE_V_MIN = 170
 MIN_WHITE_AREA = 2500
@@ -47,10 +59,10 @@ RB_MARGIN = 1.30
 TB_MARGIN = 1.30
 WHITE_RATIO_MIN = 0.18
 
-OPEN_K = 1   # screenshot showed 0, but kernel cannot be 0
+OPEN_K = 1     # screenshot showed 0, but kernel size cannot be 0
 CLOSE_K = 5
 
-# Still keep these for line / X-shape support
+# Keep your X-shape support
 CANNY1 = 40
 CANNY2 = 120
 HOUGH_TH = 30
@@ -59,16 +71,9 @@ MAX_GAP = 40
 
 BLUR_ODD = 1
 
-# Optional small-blob cleanup
 MIN_RED_BLOB_AREA = 120
 MIN_BLUE_BLOB_AREA = 120
 MIN_BLACK_BLOB_AREA = 120
-
-# Object meaning:
-# O = obstacle   (white box with thick red X)
-# T = target     (white box with thick black X)
-# E = empty
-# ? = unknown
 
 HEADING_TO_POSITIONS = {
     "front": [(-1, +1), (0, +1), (+1, +1)],
@@ -143,10 +148,8 @@ def remove_small_blobs(mask, min_area):
 
 
 def clean_mask(mask, open_k=1, close_k=5):
-    if open_k < 1:
-        open_k = 1
-    if close_k < 1:
-        close_k = 1
+    open_k = max(1, open_k)
+    close_k = max(1, close_k)
 
     if open_k % 2 == 0:
         open_k += 1
@@ -173,7 +176,7 @@ def detect_one_object_slot(slot_bgr):
         gray = cv2.GaussianBlur(gray, (k, k), 0)
 
     # -----------------------------------------------------
-    # White mask (HSV-based from screenshot)
+    # White mask
     # -----------------------------------------------------
     white_mask = cv2.inRange(
         hsv,
@@ -182,12 +185,17 @@ def detect_one_object_slot(slot_bgr):
     )
     white_mask = clean_mask(white_mask, OPEN_K, CLOSE_K)
 
+    # White candidate area
+    white_cnts, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    largest_white_area = 0.0
+    if white_cnts:
+        largest_white_area = max(cv2.contourArea(c) for c in white_cnts)
+
     # -----------------------------------------------------
     # Red mask
     # -----------------------------------------------------
     lower_red1 = np.array([0, RED_S_MIN, RED_V_MIN], dtype=np.uint8)
     upper_red1 = np.array([RED_H1_MAX, 255, 255], dtype=np.uint8)
-
     lower_red2 = np.array([RED_H2_MIN, RED_S_MIN, RED_V_MIN], dtype=np.uint8)
     upper_red2 = np.array([180, 255, 255], dtype=np.uint8)
 
@@ -240,7 +248,7 @@ def detect_one_object_slot(slot_bgr):
     black_ratio = float(np.count_nonzero(black_mask)) / total
 
     # -----------------------------------------------------
-    # X-shape support from edges
+    # X-shape check
     # -----------------------------------------------------
     edges = cv2.Canny(gray, CANNY1, CANNY2)
     lines = cv2.HoughLinesP(
@@ -274,6 +282,7 @@ def detect_one_object_slot(slot_bgr):
     has_x_shape = (diag_pos >= 1 and diag_neg >= 1)
 
     metrics = {
+        "largest_white_area": round(float(largest_white_area), 1),
         "white_ratio": round(white_ratio, 4),
         "red_ratio": round(red_ratio, 4),
         "blue_ratio": round(blue_ratio, 4),
@@ -283,11 +292,14 @@ def detect_one_object_slot(slot_bgr):
         "has_x_shape": bool(has_x_shape),
     }
 
-    # -----------------------------------------------------
-    # Decision logic using screenshot thresholds
-    # -----------------------------------------------------
-    obstacle_ok = (
+    # Must have a reasonable white-card candidate
+    white_ok = (
         white_ratio >= WHITE_RATIO_MIN and
+        largest_white_area >= MIN_WHITE_AREA
+    )
+
+    obstacle_ok = (
+        white_ok and
         red_ratio >= RED_RATIO_TH and
         blue_ratio <= BLUE_RATIO_MAX and
         red_ratio > blue_ratio * RB_MARGIN and
@@ -295,7 +307,7 @@ def detect_one_object_slot(slot_bgr):
     )
 
     target_ok = (
-        white_ratio >= WHITE_RATIO_MIN and
+        white_ok and
         black_ratio >= BLACK_RATIO_TH and
         black_ratio > blue_ratio * TB_MARGIN and
         has_x_shape
@@ -308,13 +320,9 @@ def detect_one_object_slot(slot_bgr):
         return "T", metrics
 
     if obstacle_ok and target_ok:
-        if red_ratio > black_ratio:
-            return "O", metrics
-        else:
-            return "T", metrics
+        return ("O", metrics) if red_ratio > black_ratio else ("T", metrics)
 
-    # If nothing strong enough, call empty
-    if white_ratio < WHITE_RATIO_MIN and red_ratio < RED_RATIO_TH and black_ratio < BLACK_RATIO_TH:
+    if (not white_ok) and red_ratio < RED_RATIO_TH and black_ratio < BLACK_RATIO_TH:
         return "E", metrics
 
     return "?", metrics
