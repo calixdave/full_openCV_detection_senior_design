@@ -3,18 +3,52 @@ import json
 import cv2
 import numpy as np
 
+# =========================================================
+# CONFIG
+# =========================================================
+
 SCAN_DIR = "scan_images"
-DEBUG_DIR = "debug_tiles"
+DEBUG_DIR = "debug_objects"
 RESULTS_DIR = "results"
 
 HEADINGS = ["front", "right", "back", "left"]
 
-# kept same general structure / mapping style
-ROI_TOP_FRAC = 0.55
-ROI_BOT_FRAC = 0.95
+# ---------------------------------------------------------
+# kept close to your tuned baseline
+# ---------------------------------------------------------
+
+ROI_TOP_FRAC = 0.34
+ROI_BOT_FRAC = 0.94
 
 SLOT_PAD_X_FRAC = 0.03
 SLOT_PAD_Y_FRAC = 0.06
+
+WHITE_MIN = 126
+BLACK_MAX = 95
+RED_S_MIN = 95
+RED_V_MIN = 120
+
+WHITE_RATIO_TH = 0.35
+RED_RATIO_TH = 0.18
+BLACK_RATIO_TH = 0.14
+
+EMPTY_WHITE_TH = 0.80
+EMPTY_RED_TH = 0.80
+EMPTY_BLACK_TH = 0.90
+
+CANNY1 = 40
+CANNY2 = 120
+HOUGH_TH = 30
+MIN_LINE = 8
+MAX_GAP = 40
+
+BLUR_ODD = 1
+
+# Object meaning:
+# O = obstacle   (white box with thick red X)
+# T = target     (white box with thick black X)
+# E = empty
+# ? = unknown
 
 HEADING_TO_POSITIONS = {
     "front": [(-1, +1), (0, +1), (+1, +1)],
@@ -79,106 +113,83 @@ def save_matrix_txt(path, final_grid):
             f.write(" ".join(row) + "\n")
 
 
-def center_crop(img, frac=0.50):
-    h, w = img.shape[:2]
-    y0 = int((1.0 - frac) * 0.5 * h)
-    y1 = int(h - y0)
-    x0 = int((1.0 - frac) * 0.5 * w)
-    x1 = int(w - x0)
-    return img[y0:y1, x0:x1]
+def detect_one_object_slot(slot_bgr):
+    if slot_bgr is None or slot_bgr.size == 0:
+        return "?", {}
 
+    hsv = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2GRAY)
 
-def classify_color_opencv(tile_bgr):
-    if tile_bgr is None or tile_bgr.size == 0:
-        return "unknown", "?", {"reason": "empty_roi"}
+    if BLUR_ODD > 1:
+        k = BLUR_ODD if BLUR_ODD % 2 == 1 else BLUR_ODD + 1
+        gray = cv2.GaussianBlur(gray, (k, k), 0)
 
-    roi = center_crop(tile_bgr, 0.50)
-    if roi.size == 0:
-        return "unknown", "?", {"reason": "bad_center_crop"}
+    lower_red1 = np.array([0, RED_S_MIN, RED_V_MIN], dtype=np.uint8)
+    upper_red1 = np.array([10, 255, 255], dtype=np.uint8)
+    lower_red2 = np.array([170, RED_S_MIN, RED_V_MIN], dtype=np.uint8)
+    upper_red2 = np.array([180, 255, 255], dtype=np.uint8)
 
-    roi = cv2.GaussianBlur(roi, (5, 5), 0)
+    red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    red_mask = cv2.bitwise_or(red1, red2)
+    red_ratio = float(np.count_nonzero(red_mask)) / red_mask.size
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    white_mask = cv2.inRange(gray, WHITE_MIN, 255)
+    white_ratio = float(np.count_nonzero(white_mask)) / white_mask.size
 
-    H = hsv[:, :, 0]
-    S = hsv[:, :, 1]
-    V = hsv[:, :, 2]
-    A = lab[:, :, 1]
-    B = lab[:, :, 2]
+    black_mask = cv2.inRange(gray, 0, BLACK_MAX)
+    black_ratio = float(np.count_nonzero(black_mask)) / black_mask.size
 
-    valid = (S >= 45) & (V >= 45)
+    edges = cv2.Canny(gray, CANNY1, CANNY2)
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=max(1, HOUGH_TH),
+        minLineLength=max(1, MIN_LINE),
+        maxLineGap=max(0, MAX_GAP)
+    )
 
-    valid_ratio = float(np.count_nonzero(valid)) / float(valid.size)
-    if valid_ratio < 0.12:
-        return "unknown", "?", {
-            "reason": "too_little_colored_area",
-            "valid_ratio": round(valid_ratio, 4)
-        }
+    diag_pos = 0
+    diag_neg = 0
 
-    hvals = H[valid]
-    s_mean = float(np.mean(S[valid]))
-    v_mean = float(np.mean(V[valid]))
-    h_mean = float(np.mean(hvals))
-    a_mean = float(np.mean(A[valid]))
-    b_mean = float(np.mean(B[valid]))
+    if lines is not None:
+        for ln in lines[:, 0]:
+            x1, y1, x2, y2 = ln
+            dx = x2 - x1
+            dy = y2 - y1
 
-    # masks by hue
-    red_mask = (((H <= 10) | (H >= 170)) & valid)
-    yellow_mask = ((H >= 18) & (H <= 38) & valid)
-    green_mask = ((H >= 40) & (H <= 90) & valid)
-    blue_mask = ((H >= 95) & (H <= 135) & valid)
-    pm_mask = ((H >= 136) & (H <= 169) & valid)
+            if dx == 0:
+                continue
 
-    ratios = {
-        "red": float(np.count_nonzero(red_mask)) / float(valid.size),
-        "yellow": float(np.count_nonzero(yellow_mask)) / float(valid.size),
-        "green": float(np.count_nonzero(green_mask)) / float(valid.size),
-        "blue": float(np.count_nonzero(blue_mask)) / float(valid.size),
-        "pm": float(np.count_nonzero(pm_mask)) / float(valid.size),
-    }
+            ang = np.degrees(np.arctan2(dy, dx))
 
-    label = "unknown"
-    ch = "?"
+            if 25 <= ang <= 65:
+                diag_pos += 1
+            elif -65 <= ang <= -25:
+                diag_neg += 1
 
-    best_basic = max(ratios, key=ratios.get)
-    best_ratio = ratios[best_basic]
-
-    if best_ratio >= 0.18:
-        if best_basic == "red":
-            label, ch = "red", "R"
-        elif best_basic == "yellow":
-            label, ch = "yellow", "Y"
-        elif best_basic == "green":
-            label, ch = "green", "G"
-        elif best_basic == "blue":
-            label, ch = "blue", "B"
-        elif best_basic == "pm":
-            # separate pink vs purple using brightness + LAB B channel
-            # brighter / warmer magenta tends toward pink
-            if v_mean >= 125 or b_mean >= 145:
-                label, ch = "pink", "M"
-            else:
-                label, ch = "purple", "P"
-
-    # fallback for pink/purple if hue split was weak
-    if label == "unknown":
-        if a_mean >= 145 and b_mean >= 135 and v_mean >= 110:
-            label, ch = "pink", "M"
-        elif a_mean >= 145 and b_mean < 135:
-            label, ch = "purple", "P"
+    has_x_shape = (diag_pos >= 1 and diag_neg >= 1)
 
     metrics = {
-        "valid_ratio": round(valid_ratio, 4),
-        "h_mean": round(h_mean, 2),
-        "s_mean": round(s_mean, 2),
-        "v_mean": round(v_mean, 2),
-        "lab_a_mean": round(a_mean, 2),
-        "lab_b_mean": round(b_mean, 2),
-        "ratios": {k: round(v, 4) for k, v in ratios.items()}
+        "red_ratio": round(red_ratio, 4),
+        "white_ratio": round(white_ratio, 4),
+        "black_ratio": round(black_ratio, 4),
+        "diag_pos": int(diag_pos),
+        "diag_neg": int(diag_neg),
+        "has_x_shape": bool(has_x_shape),
     }
 
-    return label, ch, metrics
+    if white_ratio > WHITE_RATIO_TH and red_ratio > RED_RATIO_TH and has_x_shape:
+        return "O", metrics
+
+    if white_ratio > WHITE_RATIO_TH and black_ratio > BLACK_RATIO_TH and has_x_shape:
+        return "T", metrics
+
+    if white_ratio < EMPTY_WHITE_TH and red_ratio < EMPTY_RED_TH and black_ratio < EMPTY_BLACK_TH:
+        return "E", metrics
+
+    return "?", metrics
 
 
 def main():
@@ -223,39 +234,38 @@ def main():
             dbg_name = os.path.join(DEBUG_DIR, f"{heading}_slot{i}.jpg")
             cv2.imwrite(dbg_name, tile)
 
-            label, ch, metrics = classify_color_opencv(tile)
+            obj_char, metrics = detect_one_object_slot(tile)
             pos = HEADING_TO_POSITIONS[heading][i]
-            final_grid[pos] = ch
+            final_grid[pos] = obj_char
 
-            print(f"  slot {i}: label={label}, char={ch}, saved={dbg_name}")
+            print(f"  slot {i}: object={obj_char}, saved={dbg_name}")
             print(f"    metrics: {metrics}")
 
             heading_info.append({
                 "slot_index": i,
                 "pos": [pos[0], pos[1]],
-                "label": label,
-                "char": ch,
+                "object": obj_char,
                 "debug_crop": dbg_name,
                 "metrics": metrics
             })
 
         detailed[heading] = heading_info
 
-    print("\nFinal 3x3 color matrix:")
+    print("\nFinal 3x3 object matrix:")
     pretty_print_matrix(final_grid)
 
     out = {
         "center": [0, 0],
         "agent": "A",
-        "grid_letters": {
+        "grid_objects": {
             f"{c},{r}": final_grid[(c, r)]
             for (c, r) in final_grid
         },
         "per_heading": detailed
     }
 
-    json_path = os.path.join(RESULTS_DIR, "color_results.json")
-    txt_path = os.path.join(RESULTS_DIR, "local_color_3x3.txt")
+    json_path = os.path.join(RESULTS_DIR, "object_results.json")
+    txt_path = os.path.join(RESULTS_DIR, "local_object_3x3.txt")
 
     with open(json_path, "w") as f:
         json.dump(out, f, indent=2)
