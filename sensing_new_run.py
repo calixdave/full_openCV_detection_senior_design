@@ -1059,7 +1059,7 @@ def map_location():
         num_views=NUM_VIEWS
     )
 
-   compact_17char = build_compact_17char(
+    compact_17char = build_compact_17char(
     local_color_3x3,   # ← USE YOUR CAMERA COLORS
     local_object_3x3,
     camera_direction_after_scan
