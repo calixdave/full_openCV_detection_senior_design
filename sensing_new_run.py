@@ -48,26 +48,6 @@ OBJECT_ROI_BOT_FRAC = 0.94
 OBJECT_SLOT_PAD_X_FRAC = 0.03
 OBJECT_SLOT_PAD_Y_FRAC = 0.06
 
-WHITE_MIN = 126
-BLACK_MAX = 95
-RED_S_MIN = 95
-RED_V_MIN = 120
-
-WHITE_RATIO_TH = 0.35
-RED_RATIO_TH = 0.18
-BLACK_RATIO_TH = 0.14
-
-EMPTY_WHITE_TH = 0.80
-EMPTY_RED_TH = 0.80
-EMPTY_BLACK_TH = 0.90
-
-CANNY1 = 40
-CANNY2 = 120
-HOUGH_TH = 30
-MIN_LINE = 8
-MAX_GAP = 40
-BLUR_ODD = 1
-
 # =========================================================
 # MAP CONFIG
 # =========================================================
@@ -514,23 +494,12 @@ def get_three_slot_rois_object(img):
 
 def detect_one_object_slot(slot_bgr):
     """
-    Conservative object detector for one slot.
+    Conservative-but-relaxed object detector.
 
-    Object definitions:
-      O = white square box with RED X
-      T = white square box with BLACK X
-      E = empty
-      ? = ambiguous / weak candidate
-
-    Strategy:
-      1) Find white rectangular candidates.
-      2) Score each candidate for:
-           - whiteness
-           - square-ish shape
-           - red-X evidence
-           - black-X evidence
-      3) Keep only the best candidate.
-      4) Prefer E unless confidence is reasonably strong.
+    O = white square with red X
+    T = white square with black X
+    E = empty
+    ? = ambiguous
     """
     if slot_bgr is None or slot_bgr.size == 0:
         return "?", {"reason": "empty_slot"}
@@ -542,45 +511,37 @@ def detect_one_object_slot(slot_bgr):
     gray = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2GRAY)
 
     # -----------------------------------------------------
-    # Thresholds tuned to be conservative
+    # Tuned to still accept real objects
     # -----------------------------------------------------
-    WHITE_V_MIN = 150
-    WHITE_S_MAX = 85
+    WHITE_V_MIN = 140
+    WHITE_S_MAX = 95
 
-    RED_S_MIN_LOCAL = 100
-    RED_V_MIN_LOCAL = 110
+    RED_S_MIN_LOCAL = 90
+    RED_V_MIN_LOCAL = 95
 
-    BLACK_MAX_LOCAL = 75
+    BLACK_MAX_LOCAL = 90
 
-    # candidate box size limits relative to slot
-    MIN_BOX_AREA_FRAC = 0.05
-    MAX_BOX_AREA_FRAC = 0.55
+    MIN_BOX_AREA_FRAC = 0.035
+    MAX_BOX_AREA_FRAC = 0.65
 
-    # candidate shape rules
-    MIN_SOLIDITY = 0.70
-    MIN_EXTENT = 0.45
-    MIN_ASPECT = 0.60
-    MAX_ASPECT = 1.70
+    MIN_SOLIDITY = 0.58
+    MIN_EXTENT = 0.34
+    MIN_ASPECT = 0.50
+    MAX_ASPECT = 1.90
 
-    # X evidence thresholds inside box ROI
-    RED_RATIO_STRONG = 0.035
-    BLACK_RATIO_STRONG = 0.060
-    MIN_X_LINE_SCORE = 2
+    RED_RATIO_STRONG = 0.020
+    BLACK_RATIO_STRONG = 0.035
+    MIN_X_LINE_SCORE = 1
 
-    # decision thresholds
-    MIN_OBJECT_SCORE = 3.2
-    MIN_UNKNOWN_SCORE = 2.2
+    MIN_OBJECT_SCORE = 2.35
+    MIN_UNKNOWN_SCORE = 1.75
 
-    # -----------------------------------------------------
-    # White mask for white box candidates
-    # -----------------------------------------------------
     H = hsv[:, :, 0]
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
     white_mask = ((S <= WHITE_S_MAX) & (V >= WHITE_V_MIN)).astype(np.uint8) * 255
 
-    # clean up white mask
     k3 = np.ones((3, 3), np.uint8)
     k5 = np.ones((5, 5), np.uint8)
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, k3)
@@ -590,9 +551,6 @@ def detect_one_object_slot(slot_bgr):
 
     candidates = []
 
-    # -----------------------------------------------------
-    # Helper: count diagonal lines in a mask ROI
-    # -----------------------------------------------------
     def diagonal_line_score(mask_roi):
         if mask_roi is None or mask_roi.size == 0:
             return 0, 0, 0
@@ -603,9 +561,9 @@ def detect_one_object_slot(slot_bgr):
             edges,
             1,
             np.pi / 180,
-            threshold=16,
-            minLineLength=max(8, int(min(mask_roi.shape[:2]) * 0.25)),
-            maxLineGap=10
+            threshold=10,
+            minLineLength=max(6, int(min(mask_roi.shape[:2]) * 0.18)),
+            maxLineGap=16
         )
 
         diag_pos = 0
@@ -621,7 +579,6 @@ def detect_one_object_slot(slot_bgr):
 
                 ang = np.degrees(np.arctan2(dy, dx))
 
-                # allow somewhat wider diagonal range
                 if 20 <= ang <= 70:
                     diag_pos += 1
                 elif -70 <= ang <= -20:
@@ -630,9 +587,6 @@ def detect_one_object_slot(slot_bgr):
         x_score = min(diag_pos, 2) + min(diag_neg, 2)
         return diag_pos, diag_neg, x_score
 
-    # -----------------------------------------------------
-    # Evaluate each white candidate box
-    # -----------------------------------------------------
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area <= 0:
@@ -660,7 +614,6 @@ def detect_one_object_slot(slot_bgr):
         if extent < MIN_EXTENT or solidity < MIN_SOLIDITY:
             continue
 
-        # slightly shrink ROI inward to reduce border noise
         pad_x = max(2, int(0.08 * bw))
         pad_y = max(2, int(0.08 * bh))
         rx0 = max(0, x + pad_x)
@@ -679,13 +632,11 @@ def detect_one_object_slot(slot_bgr):
         if roi_area <= 0:
             continue
 
-        # whiteness inside candidate
         roi_S = roi_hsv[:, :, 1]
         roi_V = roi_hsv[:, :, 2]
         roi_white_mask = ((roi_S <= WHITE_S_MAX) & (roi_V >= WHITE_V_MIN)).astype(np.uint8) * 255
         white_ratio = float(np.count_nonzero(roi_white_mask)) / roi_area
 
-        # red mask inside candidate
         lower_red1 = np.array([0, RED_S_MIN_LOCAL, RED_V_MIN_LOCAL], dtype=np.uint8)
         upper_red1 = np.array([10, 255, 255], dtype=np.uint8)
         lower_red2 = np.array([170, RED_S_MIN_LOCAL, RED_V_MIN_LOCAL], dtype=np.uint8)
@@ -697,7 +648,6 @@ def detect_one_object_slot(slot_bgr):
         red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, k3)
         red_ratio = float(np.count_nonzero(red_mask)) / roi_area
 
-        # black mask inside candidate
         black_mask = cv2.inRange(roi_gray, 0, BLACK_MAX_LOCAL)
         black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, k3)
         black_ratio = float(np.count_nonzero(black_mask)) / roi_area
@@ -705,10 +655,8 @@ def detect_one_object_slot(slot_bgr):
         red_diag_pos, red_diag_neg, red_x_score = diagonal_line_score(red_mask)
         blk_diag_pos, blk_diag_neg, blk_x_score = diagonal_line_score(black_mask)
 
-        # shape bonus for more square-like boxes
         square_bonus = max(0.0, 1.0 - abs(1.0 - aspect))
 
-        # strong type evidence
         obstacle_score = (
             2.2 * white_ratio +
             3.6 * red_ratio +
@@ -747,9 +695,6 @@ def detect_one_object_slot(slot_bgr):
             "best_score": round(best_score, 4),
         })
 
-    # -----------------------------------------------------
-    # No white box candidates -> empty
-    # -----------------------------------------------------
     slot_white_ratio = float(np.count_nonzero(white_mask)) / float(white_mask.size)
 
     if not candidates:
@@ -759,7 +704,6 @@ def detect_one_object_slot(slot_bgr):
             "num_candidates": 0
         }
 
-    # sort strongest first
     candidates.sort(key=lambda c: c["best_score"], reverse=True)
     best = candidates[0]
 
@@ -769,12 +713,9 @@ def detect_one_object_slot(slot_bgr):
         "best_candidate": best,
     }
 
-    # -----------------------------------------------------
-    # Conservative final decision
-    # -----------------------------------------------------
     if best["best_type"] == "O":
         strong_obstacle = (
-            best["white_ratio"] >= 0.40 and
+            best["white_ratio"] >= 0.34 and
             best["red_ratio"] >= RED_RATIO_STRONG and
             best["red_x_score"] >= MIN_X_LINE_SCORE and
             best["best_score"] >= MIN_OBJECT_SCORE
@@ -784,7 +725,7 @@ def detect_one_object_slot(slot_bgr):
 
     if best["best_type"] == "T":
         strong_target = (
-            best["white_ratio"] >= 0.40 and
+            best["white_ratio"] >= 0.34 and
             best["black_ratio"] >= BLACK_RATIO_STRONG and
             best["black_x_score"] >= MIN_X_LINE_SCORE and
             best["best_score"] >= MIN_OBJECT_SCORE
@@ -792,9 +733,7 @@ def detect_one_object_slot(slot_bgr):
         if strong_target:
             return "T", metrics
 
-    # if there is a decent-looking candidate but not enough confidence,
-    # mark unknown; otherwise prefer empty
-    if best["best_score"] >= MIN_UNKNOWN_SCORE and best["white_ratio"] >= 0.32:
+    if best["best_score"] >= MIN_UNKNOWN_SCORE and best["white_ratio"] >= 0.28:
         return "?", metrics
 
     return "E", metrics
@@ -878,6 +817,7 @@ def detect_objects():
     print(f"Saved: {json_path}")
     print(f"Saved: {txt_path}")
 
+
 # =========================================================
 # 4) MAP LOCATION
 # =========================================================
@@ -943,10 +883,14 @@ def score_match(local_3x3, window_3x3):
 
 
 def rotation_to_facing(rotation_ccw_deg):
+    """
+    UP/DOWN swapped from previous version because
+    left/right were correct but vertical facing was reversed.
+    """
     mapping = {
-        0: "UP",
+        0: "DOWN",
         90: "RIGHT",
-        180: "DOWN",
+        180: "UP",
         270: "LEFT",
     }
     return mapping[rotation_ccw_deg]
@@ -1099,6 +1043,9 @@ def map_location():
         camera_direction_after_scan
     )
 
+    print(f"camera_direction_before_scan = {camera_direction_before_scan}")
+    print(f"final_local_heading_after_scan = {final_local_heading_after_scan}")
+    print(f"camera_direction_after_scan = {camera_direction_after_scan}")
     print(f"compact_17char = {compact_17char}")
 
     with open(FINAL_COMPACT_FILE, "w") as f:
