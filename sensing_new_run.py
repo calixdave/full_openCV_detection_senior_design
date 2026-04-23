@@ -1037,7 +1037,7 @@ def find_best_match(local_3x3, big_grid):
 
 
 def map_location():
-    print("\n=== STEP 4: MAP LOCATION === - Untitled-3:1040")
+    print("\n=== STEP 4: MAP LOCATION ===")
 
     color_file = os.path.join(RESULTS_DIR, "local_color_3x3.txt")
     object_file = os.path.join(RESULTS_DIR, "local_object_3x3.txt")
@@ -1059,22 +1059,41 @@ def map_location():
         num_views=NUM_VIEWS
     )
 
-    compact_17char = build_compact_17char(
-    local_color_3x3,   # ← USE YOUR CAMERA COLORS
-    local_object_3x3,
-    camera_direction_after_scan
-)
-    
+    rot_steps = (best["rotation_ccw_deg"] // 90) % 4
+    rotated_object_3x3 = rotate_n_ccw(local_object_3x3, rot_steps)
 
-    print(f"camera_direction_before_scan = {camera_direction_before_scan} - Untitled-3:1069")
-    print(f"final_local_heading_after_scan = {final_local_heading_after_scan} - Untitled-3:1070")
-    print(f"camera_direction_after_scan = {camera_direction_after_scan} - Untitled-3:1071")
-    print(f"compact_17char = {compact_17char} - Untitled-3:1072")
+    compact_17char = build_compact_17char(
+        best["window"],
+        rotated_object_3x3,
+        camera_direction_after_scan
+    )
+
+    print(f"rotation_ccw_deg = {best['rotation_ccw_deg']}")
+    print(f"camera_direction_before_scan = {camera_direction_before_scan}")
+    print(f"final_local_heading_after_scan = {final_local_heading_after_scan}")
+    print(f"camera_direction_after_scan = {camera_direction_after_scan}")
+
+    print("\nLOCAL COLOR 3x3:")
+    print(pretty_matrix(local_color_3x3))
+
+    print("\nLOCAL OBJECT 3x3:")
+    print(pretty_matrix(local_object_3x3))
+
+    print("\nROTATED LOCAL COLOR 3x3 USED FOR MATCH:")
+    print(pretty_matrix(best["rotated_local"]))
+
+    print("\nROTATED OBJECT 3x3 USED FOR GLOBAL OVERLAY:")
+    print(pretty_matrix(rotated_object_3x3))
+
+    print("\nMATCHED WINDOW IN BIG_GRID:")
+    print(pretty_matrix(best["window"]))
+
+    print(f"\ncompact_17char = {compact_17char}")
 
     with open(FINAL_COMPACT_FILE, "w") as f:
         f.write(compact_17char + "\n")
 
-    print(f"Saved final compact result to: {FINAL_COMPACT_FILE} - Untitled-3:1077")
+    print(f"Saved final compact result to: {FINAL_COMPACT_FILE}")
     return compact_17char
 
 
