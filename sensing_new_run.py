@@ -217,7 +217,7 @@ def draw_capture_slot_guides(img):
 
 
 def capture_scan():
-    print("\n=== STEP 1: CAPTURE SCAN ===")
+    print("\n=== STEP 1: CAPTURE SCAN === - Untitled-3:220")
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
@@ -225,10 +225,10 @@ def capture_scan():
     if not cap.isOpened():
         raise RuntimeError("ERROR: Could not open camera.")
 
-    print("Camera opened.")
-    print("Press 'c' to capture each heading.")
-    print("Capture order: front -> right -> back -> left")
-    print("Program will continue automatically after all 4 captures.")
+    print("Camera opened. - Untitled-3:228")
+    print("Press 'c' to capture each heading. - Untitled-3:229")
+    print("Capture order: front > right > back > left - Untitled-3:230")
+    print("Program will continue automatically after all 4 captures. - Untitled-3:231")
 
     idx = 0
     last_capture_msg = ""
@@ -264,15 +264,15 @@ def capture_scan():
                 cv2.destroyAllWindows()
                 raise RuntimeError(f"ERROR: Failed to save {filename}")
 
-            print(f"Saved: {filename}")
+            print(f"Saved: {filename} - Untitled-3:267")
             last_capture_msg = f"Saved {heading}.jpg"
             idx += 1
             time.sleep(0.4)
 
     cap.release()
     cv2.destroyAllWindows()
-    print("All 4 captures completed.")
-    print("Moving to next step...")
+    print("All 4 captures completed. - Untitled-3:274")
+    print("Moving to next step... - Untitled-3:275")
 
 
 # =========================================================
@@ -409,7 +409,7 @@ def classify_color_opencv(tile_bgr):
 
 
 def detect_colors():
-    print("\n=== STEP 2: DETECT COLORS ===")
+    print("\n=== STEP 2: DETECT COLORS === - Untitled-3:412")
 
     final_grid = {
         (-1, +1): "?",
@@ -440,7 +440,7 @@ def detect_colors():
             raise RuntimeError(f"ERROR: Could not build 3 slots for heading: {heading}")
 
         heading_info = []
-        print(f"\nHeading: {heading}")
+        print(f"\nHeading: {heading} - Untitled-3:443")
 
         for i, tile in enumerate(slots):
             dbg_name = os.path.join(DEBUG_COLOR_DIR, f"{heading}_slot{i}.jpg")
@@ -450,8 +450,8 @@ def detect_colors():
             pos = HEADING_TO_POSITIONS[heading][i]
             final_grid[pos] = ch
 
-            print(f"  slot {i}: label={label}, char={ch}, saved={dbg_name}")
-            print(f"    metrics: {metrics}")
+            print(f"slot {i}: label={label}, char={ch}, saved={dbg_name} - Untitled-3:453")
+            print(f"metrics: {metrics} - Untitled-3:454")
 
             heading_info.append({
                 "slot_index": i,
@@ -482,10 +482,10 @@ def detect_colors():
 
     save_matrix_txt(txt_path, final_grid)
 
-    print("\nFinal 3x3 color matrix:")
+    print("\nFinal 3x3 color matrix: - Untitled-3:485")
     print(pretty_matrix(matrix_rows_from_grid(final_grid)))
-    print(f"Saved: {json_path}")
-    print(f"Saved: {txt_path}")
+    print(f"Saved: {json_path} - Untitled-3:487")
+    print(f"Saved: {txt_path} - Untitled-3:488")
 
 
 # =========================================================
@@ -765,7 +765,7 @@ def detect_one_object_slot(slot_bgr):
 
 
 def detect_objects():
-    print("\n=== STEP 3: DETECT OBJECTS ===")
+    print("\n=== STEP 3: DETECT OBJECTS === - Untitled-3:768")
 
     final_grid = {
         (-1, +1): "?",
@@ -796,7 +796,7 @@ def detect_objects():
             raise RuntimeError(f"ERROR: Could not build 3 slots for heading: {heading}")
 
         heading_info = []
-        print(f"\nHeading: {heading}")
+        print(f"\nHeading: {heading} - Untitled-3:799")
 
         for i, tile in enumerate(slots):
             dbg_name = os.path.join(DEBUG_OBJECT_DIR, f"{heading}_slot{i}.jpg")
@@ -806,8 +806,8 @@ def detect_objects():
             pos = HEADING_TO_POSITIONS[heading][i]
             final_grid[pos] = obj_char
 
-            print(f"  slot {i} -> grid_pos={pos}: object={obj_char}, saved={dbg_name}")
-            print(f"    metrics: {metrics}")
+            print(f"slot {i} > grid_pos={pos}: object={obj_char}, saved={dbg_name} - Untitled-3:809")
+            print(f"metrics: {metrics} - Untitled-3:810")
 
             heading_info.append({
                 "slot_index": i,
@@ -837,10 +837,10 @@ def detect_objects():
 
     save_matrix_txt(txt_path, final_grid)
 
-    print("\nFinal 3x3 object matrix:")
+    print("\nFinal 3x3 object matrix: - Untitled-3:840")
     print(pretty_matrix(matrix_rows_from_grid(final_grid)))
-    print(f"Saved: {json_path}")
-    print(f"Saved: {txt_path}")
+    print(f"Saved: {json_path} - Untitled-3:842")
+    print(f"Saved: {txt_path} - Untitled-3:843")
 
 
 # =========================================================
@@ -1037,7 +1037,7 @@ def find_best_match(local_3x3, big_grid):
 
 
 def map_location():
-    print("\n=== STEP 4: MAP LOCATION ===")
+    print("\n=== STEP 4: MAP LOCATION === - Untitled-3:1040")
 
     color_file = os.path.join(RESULTS_DIR, "local_color_3x3.txt")
     object_file = os.path.join(RESULTS_DIR, "local_object_3x3.txt")
@@ -1064,17 +1064,17 @@ def map_location():
     local_object_3x3,
     camera_direction_after_scan
 )
-    )
+    
 
-    print(f"camera_direction_before_scan = {camera_direction_before_scan}")
-    print(f"final_local_heading_after_scan = {final_local_heading_after_scan}")
-    print(f"camera_direction_after_scan = {camera_direction_after_scan}")
-    print(f"compact_17char = {compact_17char}")
+    print(f"camera_direction_before_scan = {camera_direction_before_scan} - Untitled-3:1069")
+    print(f"final_local_heading_after_scan = {final_local_heading_after_scan} - Untitled-3:1070")
+    print(f"camera_direction_after_scan = {camera_direction_after_scan} - Untitled-3:1071")
+    print(f"compact_17char = {compact_17char} - Untitled-3:1072")
 
     with open(FINAL_COMPACT_FILE, "w") as f:
         f.write(compact_17char + "\n")
 
-    print(f"Saved final compact result to: {FINAL_COMPACT_FILE}")
+    print(f"Saved final compact result to: {FINAL_COMPACT_FILE} - Untitled-3:1077")
     return compact_17char
 
 
@@ -1091,11 +1091,11 @@ def main():
         detect_objects()
         compact_17char = map_location()
 
-        print("\n=== DONE ===")
-        print(f"Final compact_17char: {compact_17char}")
+        print("\n=== DONE === - Untitled-3:1094")
+        print(f"Final compact_17char: {compact_17char} - Untitled-3:1095")
 
     except Exception as e:
-        print(f"\nERROR: {e}")
+        print(f"\nERROR: {e} - Untitled-3:1098")
 
 
 if __name__ == "__main__":
