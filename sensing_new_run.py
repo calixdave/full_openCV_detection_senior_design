@@ -522,18 +522,15 @@ def get_three_slot_rois_object(img):
 
     return slots
 
-
 def detect_one_object_slot(slot_bgr):
     """
-    X-first detector:
-      T = big BLACK X inside white square
-      O = big RED X inside white square
-      E = otherwise
+    Center-focused X detector.
 
-    Why this version:
-      The black/red X often splits the white square into multiple white regions,
-      so detecting the white box first is unreliable. Instead we detect the X first,
-      then verify that it is surrounded by a white square region.
+    T = large BLACK X with enough surrounding white
+    O = large RED X with enough surrounding white
+    E = otherwise
+
+    Tuned for your current target: tilted white square with thick black X.
     """
     if slot_bgr is None or slot_bgr.size == 0:
         return "E", {"reason": "empty_slot"}
@@ -549,39 +546,58 @@ def detect_one_object_slot(slot_bgr):
     V = hsv[:, :, 2]
 
     # -----------------------------------------------------
+    # Restrict search to center region of slot
+    # Helps reject tile seams / background clutter near edges
+    # -----------------------------------------------------
+    cx0 = int(0.15 * w)
+    cx1 = int(0.85 * w)
+    cy0 = int(0.12 * h)
+    cy1 = int(0.92 * h)
+
+    search_hsv = hsv[cy0:cy1, cx0:cx1]
+    search_gray = gray[cy0:cy1, cx0:cx1]
+
+    sh, sw = search_gray.shape[:2]
+    search_area = float(sh * sw)
+
+    search_H = search_hsv[:, :, 0]
+    search_S = search_hsv[:, :, 1]
+    search_V = search_hsv[:, :, 2]
+
+    # -----------------------------------------------------
     # Masks
     # -----------------------------------------------------
-    # black X mask
-    BLACK_MAX = 95
-    black_mask = ((gray <= BLACK_MAX)).astype(np.uint8) * 255
+    BLACK_MAX = 105
+    RED_S_MIN = 70
+    RED_V_MIN = 65
 
-    # red X mask
-    RED_S_MIN = 75
-    RED_V_MIN = 70
+    WHITE_V_MIN = 135
+    WHITE_S_MAX = 120
+
+    black_mask = ((search_gray <= BLACK_MAX)).astype(np.uint8) * 255
     red_mask = (
-        (((H <= 12) | (H >= 168)) & (S >= RED_S_MIN) & (V >= RED_V_MIN))
+        (((search_H <= 12) | (search_H >= 168)) &
+         (search_S >= RED_S_MIN) &
+         (search_V >= RED_V_MIN))
+    ).astype(np.uint8) * 255
+    white_mask = (
+        ((search_V >= WHITE_V_MIN) & (search_S <= WHITE_S_MAX))
     ).astype(np.uint8) * 255
 
     k3 = np.ones((3, 3), np.uint8)
     k5 = np.ones((5, 5), np.uint8)
 
     black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, k3)
-    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, k3)
+    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, k5)
 
     red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, k3)
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, k3)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, k5)
 
-    # -----------------------------------------------------
-    # White-surround mask
-    # -----------------------------------------------------
-    WHITE_V_MIN = 140
-    WHITE_S_MAX = 110
-    white_mask = ((V >= WHITE_V_MIN) & (S <= WHITE_S_MAX)).astype(np.uint8) * 255
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, k3)
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, k5)
 
     # -----------------------------------------------------
-    # Hough helper for X check
+    # Hough helper for X confirmation
     # -----------------------------------------------------
     def diagonal_counts(mask_roi):
         if mask_roi is None or mask_roi.size == 0:
@@ -593,8 +609,8 @@ def detect_one_object_slot(slot_bgr):
             1,
             np.pi / 180,
             threshold=8,
-            minLineLength=max(8, int(min(mask_roi.shape[:2]) * 0.22)),
-            maxLineGap=12
+            minLineLength=max(10, int(min(mask_roi.shape[:2]) * 0.25)),
+            maxLineGap=14
         )
 
         pos = 0
@@ -609,61 +625,55 @@ def detect_one_object_slot(slot_bgr):
                     continue
 
                 ang = np.degrees(np.arctan2(dy, dx))
-                if 22 <= ang <= 68:
+                if 20 <= ang <= 70:
                     pos += 1
-                elif -68 <= ang <= -22:
+                elif -70 <= ang <= -20:
                     neg += 1
 
         x_score = min(pos, 2) + min(neg, 2)
         return pos, neg, x_score
 
     # -----------------------------------------------------
-    # Candidate extractor from X masks
+    # Candidate builder from black/red masks
     # -----------------------------------------------------
-    def build_candidates_from_mask(mask, x_type):
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def candidates_from_mask(mask, obj_type):
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         out = []
 
-        for cnt in contours:
+        for cnt in cnts:
             area = cv2.contourArea(cnt)
             if area <= 0:
                 continue
 
-            area_frac = area / slot_area
-            if area_frac < 0.006 or area_frac > 0.18:
+            area_frac = area / search_area
+            # allow larger object than before
+            if area_frac < 0.015 or area_frac > 0.45:
                 continue
 
             x, y, bw, bh = cv2.boundingRect(cnt)
-            if bw < 12 or bh < 12:
+            if bw < 18 or bh < 18:
                 continue
 
             aspect = bw / float(bh)
             if aspect < 0.45 or aspect > 1.90:
                 continue
 
-            # X should be relatively centered in the slot
-            cx = x + bw / 2.0
-            cy = y + bh / 2.0
-            center_dist = np.sqrt((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2)
-            center_dist_frac = center_dist / max(1.0, np.sqrt(w * w + h * h))
-            if center_dist_frac > 0.28:
-                continue
-
-            # verify diagonal structure on the ink itself
+            # diagonal check on ink
             ink_roi = mask[y:y+bh, x:x+bw]
             pos, neg, x_score = diagonal_counts(ink_roi)
+
             has_x = (pos >= 1 and neg >= 1)
             if not has_x:
                 continue
 
-            # expand around X to look for surrounding white box
-            ex = int(0.45 * bw)
-            ey = int(0.45 * bh)
+            # expand around X to inspect white surround
+            ex = int(0.32 * bw)
+            ey = int(0.32 * bh)
 
             rx0 = max(0, x - ex)
             ry0 = max(0, y - ey)
-            rx1 = min(w, x + bw + ex)
-            ry1 = min(h, y + bh + ey)
+            rx1 = min(sw, x + bw + ex)
+            ry1 = min(sh, y + bh + ey)
 
             if rx1 <= rx0 or ry1 <= ry0:
                 continue
@@ -680,49 +690,48 @@ def detect_one_object_slot(slot_bgr):
             black_ratio = float(np.count_nonzero(roi_black)) / roi_area
             red_ratio = float(np.count_nonzero(roi_red)) / roi_area
 
-            # ring test:
-            # outer region should be white, not just the X center
-            inner_pad_x = max(1, int(0.20 * (rx1 - rx0)))
-            inner_pad_y = max(1, int(0.20 * (ry1 - ry0)))
+            # ring around center should be white
+            ring = np.ones((ry1 - ry0, rx1 - rx0), dtype=np.uint8)
+            ix0 = max(0, x - rx0)
+            iy0 = max(0, y - ry0)
+            ix1 = min(rx1 - rx0, x + bw - rx0)
+            iy1 = min(ry1 - ry0, y + bh - ry0)
+            ring[iy0:iy1, ix0:ix1] = 0
 
-            inner_x0 = min(rx1, rx0 + inner_pad_x)
-            inner_y0 = min(ry1, ry0 + inner_pad_y)
-            inner_x1 = max(rx0, rx1 - inner_pad_x)
-            inner_y1 = max(ry0, ry1 - inner_pad_y)
-
-            ring_mask = np.ones((ry1 - ry0, rx1 - rx0), dtype=np.uint8)
-            if inner_x1 > inner_x0 and inner_y1 > inner_y0:
-                ring_mask[inner_y0-ry0:inner_y1-ry0, inner_x0-rx0:inner_x1-rx0] = 0
-
-            ring_area = float(np.count_nonzero(ring_mask))
+            ring_area = float(np.count_nonzero(ring))
             if ring_area <= 0:
                 continue
 
-            ring_white_ratio = float(np.count_nonzero((roi_white > 0) & (ring_mask > 0))) / ring_area
+            ring_white_ratio = float(np.count_nonzero((roi_white > 0) & (ring > 0))) / ring_area
 
-            square_bonus = max(0.0, 1.0 - abs(1.0 - aspect))
-            center_bonus = max(0.0, 1.0 - (center_dist_frac / 0.28))
+            # prefer centered candidates
+            ccx = x + bw / 2.0
+            ccy = y + bh / 2.0
+            center_dist = np.sqrt((ccx - sw / 2.0) ** 2 + (ccy - sh / 2.0) ** 2)
+            center_dist_frac = center_dist / max(1.0, np.sqrt(sw * sw + sh * sh))
+            if center_dist_frac > 0.24:
+                continue
 
-            if x_type == "T":
-                type_ratio = black_ratio
+            center_bonus = max(0.0, 1.0 - (center_dist_frac / 0.24))
+
+            if obj_type == "T":
+                ink_ratio = black_ratio
             else:
-                type_ratio = red_ratio
+                ink_ratio = red_ratio
 
             score = (
-                1.2 * ring_white_ratio +
-                0.8 * type_ratio +
-                0.45 * x_score +
-                0.35 * square_bonus +
-                0.35 * center_bonus
+                1.1 * ring_white_ratio +
+                0.9 * ink_ratio +
+                0.5 * x_score +
+                0.5 * center_bonus
             )
 
             out.append({
-                "type": x_type,
-                "x_bbox": [int(x), int(y), int(bw), int(bh)],
-                "outer_bbox": [int(rx0), int(ry0), int(rx1 - rx0), int(ry1 - ry0)],
+                "type": obj_type,
+                "ink_bbox_local": [int(x), int(y), int(bw), int(bh)],
+                "outer_bbox_local": [int(rx0), int(ry0), int(rx1 - rx0), int(ry1 - ry0)],
                 "area_frac": round(area_frac, 4),
                 "aspect": round(aspect, 4),
-                "center_dist_frac": round(center_dist_frac, 4),
                 "pos_lines": int(pos),
                 "neg_lines": int(neg),
                 "x_score": int(x_score),
@@ -730,58 +739,48 @@ def detect_one_object_slot(slot_bgr):
                 "ring_white_ratio": round(ring_white_ratio, 4),
                 "black_ratio": round(black_ratio, 4),
                 "red_ratio": round(red_ratio, 4),
+                "center_dist_frac": round(center_dist_frac, 4),
                 "score": round(score, 4),
             })
 
         return out
 
-    target_candidates = build_candidates_from_mask(black_mask, "T")
-    obstacle_candidates = build_candidates_from_mask(red_mask, "O")
+    target_candidates = candidates_from_mask(black_mask, "T")
+    obstacle_candidates = candidates_from_mask(red_mask, "O")
     candidates = target_candidates + obstacle_candidates
 
-    slot_white_ratio = float(np.count_nonzero(white_mask)) / float(white_mask.size)
-    slot_black_ratio = float(np.count_nonzero(black_mask)) / float(black_mask.size)
-    slot_red_ratio = float(np.count_nonzero(red_mask)) / float(red_mask.size)
+    metrics = {
+        "search_box": [cx0, cy0, cx1 - cx0, cy1 - cy0],
+        "slot_black_ratio": round(float(np.count_nonzero(black_mask)) / black_mask.size, 4),
+        "slot_red_ratio": round(float(np.count_nonzero(red_mask)) / red_mask.size, 4),
+        "slot_white_ratio": round(float(np.count_nonzero(white_mask)) / white_mask.size, 4),
+        "num_candidates": len(candidates),
+    }
 
     if not candidates:
-        return "E", {
-            "reason": "no_x_candidate",
-            "slot_white_ratio": round(slot_white_ratio, 4),
-            "slot_black_ratio": round(slot_black_ratio, 4),
-            "slot_red_ratio": round(slot_red_ratio, 4),
-            "num_candidates": 0
-        }
+        metrics["reason"] = "no_center_x_candidate"
+        return "E", metrics
 
     candidates.sort(key=lambda c: c["score"], reverse=True)
     best = candidates[0]
+    metrics["best_candidate"] = best
 
-    metrics = {
-        "slot_white_ratio": round(slot_white_ratio, 4),
-        "slot_black_ratio": round(slot_black_ratio, 4),
-        "slot_red_ratio": round(slot_red_ratio, 4),
-        "num_candidates": len(candidates),
-        "best_candidate": best
-    }
-
-    # -----------------------------------------------------
-    # Final decision gates
-    # -----------------------------------------------------
     if best["type"] == "T":
         strong_target = (
-            best["ring_white_ratio"] >= 0.18 and
-            best["black_ratio"] >= 0.05 and
+            best["ring_white_ratio"] >= 0.12 and
+            best["black_ratio"] >= 0.20 and
             best["x_score"] >= 2 and
-            best["score"] >= 1.65
+            best["score"] >= 1.45
         )
         if strong_target:
             return "T", metrics
 
     if best["type"] == "O":
         strong_obstacle = (
-            best["ring_white_ratio"] >= 0.18 and
-            best["red_ratio"] >= 0.018 and
+            best["ring_white_ratio"] >= 0.12 and
+            best["red_ratio"] >= 0.03 and
             best["x_score"] >= 2 and
-            best["score"] >= 1.55
+            best["score"] >= 1.35
         )
         if strong_obstacle:
             return "O", metrics
