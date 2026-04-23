@@ -48,6 +48,37 @@ OBJECT_ROI_BOT_FRAC = 0.94
 OBJECT_SLOT_PAD_X_FRAC = 0.03
 OBJECT_SLOT_PAD_Y_FRAC = 0.06
 
+# white box thresholds
+OBJ_WHITE_V_MIN = 145
+OBJ_WHITE_S_MAX = 95
+
+# red X thresholds
+OBJ_RED_S_MIN = 90
+OBJ_RED_V_MIN = 95
+
+# black X threshold
+OBJ_BLACK_MAX = 85
+
+# shape thresholds
+OBJ_MIN_BOX_AREA_FRAC = 0.030
+OBJ_MAX_BOX_AREA_FRAC = 0.70
+OBJ_MIN_ASPECT = 0.50
+OBJ_MAX_ASPECT = 1.90
+OBJ_MIN_SOLIDITY = 0.55
+OBJ_MIN_EXTENT = 0.32
+OBJ_MIN_FILL_RATIO = 0.28
+
+# evidence thresholds
+OBJ_MIN_WHITE_RATIO_IN_BOX = 0.26
+OBJ_MIN_RED_RATIO_IN_BOX = 0.015
+OBJ_MIN_BLACK_RATIO_IN_BOX = 0.025
+OBJ_MIN_DIAG_LINES_ONE_SIDE = 1
+OBJ_MIN_X_SCORE = 2
+
+# final scoring thresholds
+OBJ_MIN_STRONG_SCORE = 2.05
+OBJ_MIN_UNKNOWN_SCORE = 1.45
+
 # =========================================================
 # MAP CONFIG
 # =========================================================
@@ -494,10 +525,15 @@ def get_three_slot_rois_object(img):
 
 def detect_one_object_slot(slot_bgr):
     """
-    Conservative-but-relaxed object detector.
+    New object logic:
+      1) Find white square / rectangle candidates.
+      2) For each candidate, look inside it for an X.
+      3) Measure whether the X is red or black.
+      4) Choose the best candidate.
+      5) Return O / T / E / ?.
 
-    O = white square with red X
-    T = white square with black X
+    O = obstacle = white box + red X
+    T = target   = white box + black X
     E = empty
     ? = ambiguous
     """
@@ -510,60 +546,37 @@ def detect_one_object_slot(slot_bgr):
     hsv = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2GRAY)
 
-    # -----------------------------------------------------
-    # Tuned to still accept real objects
-    # -----------------------------------------------------
-    WHITE_V_MIN = 140
-    WHITE_S_MAX = 95
-
-    RED_S_MIN_LOCAL = 90
-    RED_V_MIN_LOCAL = 95
-
-    BLACK_MAX_LOCAL = 90
-
-    MIN_BOX_AREA_FRAC = 0.035
-    MAX_BOX_AREA_FRAC = 0.65
-
-    MIN_SOLIDITY = 0.58
-    MIN_EXTENT = 0.34
-    MIN_ASPECT = 0.50
-    MAX_ASPECT = 1.90
-
-    RED_RATIO_STRONG = 0.020
-    BLACK_RATIO_STRONG = 0.035
-    MIN_X_LINE_SCORE = 1
-
-    MIN_OBJECT_SCORE = 2.35
-    MIN_UNKNOWN_SCORE = 1.75
-
     H = hsv[:, :, 0]
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
-    white_mask = ((S <= WHITE_S_MAX) & (V >= WHITE_V_MIN)).astype(np.uint8) * 255
+    # -----------------------------------------------------
+    # White box detection
+    # -----------------------------------------------------
+    white_mask = ((S <= OBJ_WHITE_S_MAX) & (V >= OBJ_WHITE_V_MIN)).astype(np.uint8) * 255
 
     k3 = np.ones((3, 3), np.uint8)
     k5 = np.ones((5, 5), np.uint8)
+
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, k3)
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, k5)
+    white_mask = cv2.dilate(white_mask, k3, iterations=1)
 
     contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    candidates = []
 
     def diagonal_line_score(mask_roi):
         if mask_roi is None or mask_roi.size == 0:
             return 0, 0, 0
 
-        edges = cv2.Canny(mask_roi, 40, 120)
+        edges = cv2.Canny(mask_roi, 30, 110)
 
         lines = cv2.HoughLinesP(
             edges,
             1,
             np.pi / 180,
             threshold=10,
-            minLineLength=max(6, int(min(mask_roi.shape[:2]) * 0.18)),
-            maxLineGap=16
+            minLineLength=max(6, int(min(mask_roi.shape[:2]) * 0.16)),
+            maxLineGap=18
         )
 
         diag_pos = 0
@@ -579,13 +592,15 @@ def detect_one_object_slot(slot_bgr):
 
                 ang = np.degrees(np.arctan2(dy, dx))
 
-                if 20 <= ang <= 70:
+                if 18 <= ang <= 72:
                     diag_pos += 1
-                elif -70 <= ang <= -20:
+                elif -72 <= ang <= -18:
                     diag_neg += 1
 
         x_score = min(diag_pos, 2) + min(diag_neg, 2)
         return diag_pos, diag_neg, x_score
+
+    candidates = []
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -593,15 +608,15 @@ def detect_one_object_slot(slot_bgr):
             continue
 
         area_frac = area / slot_area
-        if area_frac < MIN_BOX_AREA_FRAC or area_frac > MAX_BOX_AREA_FRAC:
+        if area_frac < OBJ_MIN_BOX_AREA_FRAC or area_frac > OBJ_MAX_BOX_AREA_FRAC:
             continue
 
         x, y, bw, bh = cv2.boundingRect(cnt)
-        if bw < 8 or bh < 8:
+        if bw < 10 or bh < 10:
             continue
 
         aspect = bw / float(bh)
-        if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
+        if aspect < OBJ_MIN_ASPECT or aspect > OBJ_MAX_ASPECT:
             continue
 
         rect_area = float(bw * bh)
@@ -611,11 +626,19 @@ def detect_one_object_slot(slot_bgr):
         hull_area = cv2.contourArea(hull)
         solidity = area / hull_area if hull_area > 0 else 0.0
 
-        if extent < MIN_EXTENT or solidity < MIN_SOLIDITY:
-            continue
+        fill_ratio = area / slot_area
 
-        pad_x = max(2, int(0.08 * bw))
-        pad_y = max(2, int(0.08 * bh))
+        if solidity < OBJ_MIN_SOLIDITY:
+            continue
+        if extent < OBJ_MIN_EXTENT:
+            continue
+        if fill_ratio < OBJ_MIN_FILL_RATIO * OBJ_MIN_BOX_AREA_FRAC:
+            pass
+
+        # slightly shrink inward to focus on the inside of the white box
+        pad_x = max(2, int(0.10 * bw))
+        pad_y = max(2, int(0.10 * bh))
+
         rx0 = max(0, x + pad_x)
         ry0 = max(0, y + pad_y)
         rx1 = min(w, x + bw - pad_x)
@@ -624,7 +647,6 @@ def detect_one_object_slot(slot_bgr):
         if rx1 <= rx0 or ry1 <= ry0:
             continue
 
-        roi_bgr = slot_bgr[ry0:ry1, rx0:rx1]
         roi_hsv = hsv[ry0:ry1, rx0:rx1]
         roi_gray = gray[ry0:ry1, rx0:rx1]
 
@@ -634,22 +656,29 @@ def detect_one_object_slot(slot_bgr):
 
         roi_S = roi_hsv[:, :, 1]
         roi_V = roi_hsv[:, :, 2]
-        roi_white_mask = ((roi_S <= WHITE_S_MAX) & (roi_V >= WHITE_V_MIN)).astype(np.uint8) * 255
+
+        # whiteness inside the candidate
+        roi_white_mask = ((roi_S <= OBJ_WHITE_S_MAX) & (roi_V >= OBJ_WHITE_V_MIN)).astype(np.uint8) * 255
+        roi_white_mask = cv2.morphologyEx(roi_white_mask, cv2.MORPH_OPEN, k3)
         white_ratio = float(np.count_nonzero(roi_white_mask)) / roi_area
 
-        lower_red1 = np.array([0, RED_S_MIN_LOCAL, RED_V_MIN_LOCAL], dtype=np.uint8)
+        # red X inside box
+        lower_red1 = np.array([0, OBJ_RED_S_MIN, OBJ_RED_V_MIN], dtype=np.uint8)
         upper_red1 = np.array([10, 255, 255], dtype=np.uint8)
-        lower_red2 = np.array([170, RED_S_MIN_LOCAL, RED_V_MIN_LOCAL], dtype=np.uint8)
+        lower_red2 = np.array([170, OBJ_RED_S_MIN, OBJ_RED_V_MIN], dtype=np.uint8)
         upper_red2 = np.array([180, 255, 255], dtype=np.uint8)
 
         red1 = cv2.inRange(roi_hsv, lower_red1, upper_red1)
         red2 = cv2.inRange(roi_hsv, lower_red2, upper_red2)
         red_mask = cv2.bitwise_or(red1, red2)
         red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, k3)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, k3)
         red_ratio = float(np.count_nonzero(red_mask)) / roi_area
 
-        black_mask = cv2.inRange(roi_gray, 0, BLACK_MAX_LOCAL)
+        # black X inside box
+        black_mask = cv2.inRange(roi_gray, 0, OBJ_BLACK_MAX)
         black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, k3)
+        black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, k3)
         black_ratio = float(np.count_nonzero(black_mask)) / roi_area
 
         red_diag_pos, red_diag_neg, red_x_score = diagonal_line_score(red_mask)
@@ -657,18 +686,24 @@ def detect_one_object_slot(slot_bgr):
 
         square_bonus = max(0.0, 1.0 - abs(1.0 - aspect))
 
+        # score white box quality
+        box_score = (
+            1.2 * white_ratio +
+            0.8 * square_bonus +
+            0.6 * min(1.0, solidity) +
+            0.4 * min(1.0, extent)
+        )
+
         obstacle_score = (
-            2.2 * white_ratio +
-            3.6 * red_ratio +
-            0.45 * red_x_score +
-            0.35 * square_bonus
+            box_score +
+            3.0 * red_ratio +
+            0.55 * red_x_score
         )
 
         target_score = (
-            2.2 * white_ratio +
-            2.8 * black_ratio +
-            0.45 * blk_x_score +
-            0.35 * square_bonus
+            box_score +
+            2.6 * black_ratio +
+            0.55 * blk_x_score
         )
 
         best_type = "O" if obstacle_score >= target_score else "T"
@@ -677,9 +712,9 @@ def detect_one_object_slot(slot_bgr):
         candidates.append({
             "bbox": [int(x), int(y), int(bw), int(bh)],
             "area_frac": round(area_frac, 4),
-            "extent": round(extent, 4),
-            "solidity": round(solidity, 4),
             "aspect": round(aspect, 4),
+            "solidity": round(solidity, 4),
+            "extent": round(extent, 4),
             "white_ratio": round(white_ratio, 4),
             "red_ratio": round(red_ratio, 4),
             "black_ratio": round(black_ratio, 4),
@@ -689,6 +724,7 @@ def detect_one_object_slot(slot_bgr):
             "black_diag_neg": int(blk_diag_neg),
             "red_x_score": int(red_x_score),
             "black_x_score": int(blk_x_score),
+            "box_score": round(box_score, 4),
             "obstacle_score": round(obstacle_score, 4),
             "target_score": round(target_score, 4),
             "best_type": best_type,
@@ -699,7 +735,7 @@ def detect_one_object_slot(slot_bgr):
 
     if not candidates:
         return "E", {
-            "reason": "no_valid_white_box",
+            "reason": "no_white_box_candidate",
             "slot_white_ratio": round(slot_white_ratio, 4),
             "num_candidates": 0
         }
@@ -710,30 +746,31 @@ def detect_one_object_slot(slot_bgr):
     metrics = {
         "slot_white_ratio": round(slot_white_ratio, 4),
         "num_candidates": len(candidates),
-        "best_candidate": best,
+        "best_candidate": best
     }
 
-    if best["best_type"] == "O":
-        strong_obstacle = (
-            best["white_ratio"] >= 0.34 and
-            best["red_ratio"] >= RED_RATIO_STRONG and
-            best["red_x_score"] >= MIN_X_LINE_SCORE and
-            best["best_score"] >= MIN_OBJECT_SCORE
-        )
-        if strong_obstacle:
-            return "O", metrics
+    strong_obstacle = (
+        best["white_ratio"] >= OBJ_MIN_WHITE_RATIO_IN_BOX and
+        best["red_ratio"] >= OBJ_MIN_RED_RATIO_IN_BOX and
+        best["red_x_score"] >= OBJ_MIN_X_SCORE and
+        best["best_score"] >= OBJ_MIN_STRONG_SCORE
+    )
 
-    if best["best_type"] == "T":
-        strong_target = (
-            best["white_ratio"] >= 0.34 and
-            best["black_ratio"] >= BLACK_RATIO_STRONG and
-            best["black_x_score"] >= MIN_X_LINE_SCORE and
-            best["best_score"] >= MIN_OBJECT_SCORE
-        )
-        if strong_target:
-            return "T", metrics
+    strong_target = (
+        best["white_ratio"] >= OBJ_MIN_WHITE_RATIO_IN_BOX and
+        best["black_ratio"] >= OBJ_MIN_BLACK_RATIO_IN_BOX and
+        best["black_x_score"] >= OBJ_MIN_X_SCORE and
+        best["best_score"] >= OBJ_MIN_STRONG_SCORE
+    )
 
-    if best["best_score"] >= MIN_UNKNOWN_SCORE and best["white_ratio"] >= 0.28:
+    if best["best_type"] == "O" and strong_obstacle:
+        return "O", metrics
+
+    if best["best_type"] == "T" and strong_target:
+        return "T", metrics
+
+    # If it looks like a white box exists but X evidence is weak, call it unknown.
+    if best["best_score"] >= OBJ_MIN_UNKNOWN_SCORE and best["white_ratio"] >= 0.22:
         return "?", metrics
 
     return "E", metrics
@@ -883,10 +920,7 @@ def score_match(local_3x3, window_3x3):
 
 
 def rotation_to_facing(rotation_ccw_deg):
-    """
-    UP/DOWN swapped from previous version because
-    left/right were correct but vertical facing was reversed.
-    """
+    # swapped UP/DOWN from the earlier runner behavior
     mapping = {
         0: "DOWN",
         90: "RIGHT",
