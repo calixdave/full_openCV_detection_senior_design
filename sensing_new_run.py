@@ -1,10 +1,12 @@
 import os
+import sys
 import json
+import subprocess
 import cv2
 import numpy as np
 
 # =========================================================
-# PI-SAFE SETTINGS
+# PI SAFE OPENCV SETTINGS
 # =========================================================
 
 cv2.setNumThreads(1)
@@ -25,42 +27,57 @@ DEBUG_ARUCO_DIR = "debug_aruco"
 
 HEADINGS = ["front", "right", "back", "left"]
 
-# Saved images expected:
-# scan_images/front.jpg
-# scan_images/right.jpg
-# scan_images/back.jpg
-# scan_images/left.jpg
+# External programs
+CAPTURE_SCRIPT = "capture_scan.py"
+COLOR_SCRIPT = "detect_colors.py"
+MAP_SCRIPT = "map_location.py"
 
+# ArUco object IDs
 TARGET_IDS = {0}
 OBSTACLE_IDS = {1, 2, 3}
 
-# Focus only on the front row area
+# Front-row ROI only
 ROI_TOP_FRAC = 0.45
 ROI_BOT_FRAC = 0.95
 
+# Pi safety: resize large images before ArUco detection
 MAX_WIDTH = 800
 
+os.makedirs(SCAN_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(DEBUG_ARUCO_DIR, exist_ok=True)
 
 
 # =========================================================
-# STEP 1: SCAN
+# GENERAL HELPERS
 # =========================================================
 
-def step1_scan():
-    """
-    Your scan program should already save:
-        scan_images/front.jpg
-        scan_images/right.jpg
-        scan_images/back.jpg
-        scan_images/left.jpg
+def run_script(script_name, step_name):
+    if not os.path.exists(script_name):
+        print(f"[WARN] {script_name} not found. Skipping {step_name}.")
+        return False
 
-    This runner assumes the images already exist.
-    """
-    print("\nSTEP 1: SCAN")
-    print("Using already saved images from scan_images/")
+    print(f"\n{step_name}")
+    print(f"Running {script_name}...")
 
+    try:
+        result = subprocess.run(
+            [sys.executable, script_name],
+            check=False
+        )
+
+        if result.returncode != 0:
+            print(f"[WARN] {script_name} ended with return code {result.returncode}")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"[ERROR] Could not run {script_name}: {e}")
+        return False
+
+
+def check_scan_images():
     missing = []
 
     for heading in HEADINGS:
@@ -69,11 +86,28 @@ def step1_scan():
             missing.append(path)
 
     if missing:
-        print("[WARN] Missing scan images:")
+        print("\n[WARN] Missing scan images:")
         for path in missing:
             print("  ", path)
+        return False
+
+    print("\nAll scan images found.")
+    return True
+
+
+# =========================================================
+# STEP 1: CAPTURE / SCAN
+# =========================================================
+
+def step1_scan():
+    print("\nSTEP 1: SCAN")
+
+    if os.path.exists(CAPTURE_SCRIPT):
+        run_script(CAPTURE_SCRIPT, "STEP 1: SCAN")
     else:
-        print("All scan images found.")
+        print("No capture script found. Using existing images in scan_images/.")
+
+    check_scan_images()
 
 
 # =========================================================
@@ -81,22 +115,12 @@ def step1_scan():
 # =========================================================
 
 def step2_detect_colors():
-    """
-    Replace this with your real color detection function.
-
-    It should produce your color 3x3 file/result.
-    """
     print("\nSTEP 2: DETECT COLORS")
-    print("Call your existing color detector here.")
 
-    # Example placeholder
-    color_grid = [
-        ["?", "?", "?"],
-        ["?", "A", "?"],
-        ["?", "?", "?"],
-    ]
-
-    return color_grid
+    if os.path.exists(COLOR_SCRIPT):
+        run_script(COLOR_SCRIPT, "STEP 2: DETECT COLORS")
+    else:
+        print(f"[WARN] {COLOR_SCRIPT} not found. Skipping color detection.")
 
 
 # =========================================================
@@ -104,14 +128,10 @@ def step2_detect_colors():
 # =========================================================
 
 def setup_aruco_detector():
-    """
-    Handles old and new OpenCV ArUco APIs safely.
-    """
-
     if not hasattr(cv2, "aruco"):
         raise RuntimeError(
             "cv2.aruco is not available. "
-            "On Raspberry Pi, install with: sudo apt install python3-opencv"
+            "Install OpenCV contrib or use: sudo apt install python3-opencv"
         )
 
     aruco = cv2.aruco
@@ -126,7 +146,7 @@ def setup_aruco_detector():
     except AttributeError:
         params = aruco.DetectorParameters_create()
 
-    # Safer on Raspberry Pi
+    # Pi-safe: avoid unstable corner refinement
     try:
         params.cornerRefinementMethod = aruco.CORNER_REFINE_NONE
     except Exception:
@@ -140,15 +160,21 @@ def setup_aruco_detector():
     return aruco, dictionary, params, detector
 
 
+def resize_for_pi(img):
+    h, w = img.shape[:2]
+
+    if w <= MAX_WIDTH:
+        return img
+
+    scale = MAX_WIDTH / float(w)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
 def safe_detect_markers(gray_img, aruco, dictionary, params, detector):
-    """
-    Detects ArUco markers without crashing the whole runner.
-    """
-
-    if gray_img is None:
-        return [], None
-
-    if gray_img.size == 0:
+    if gray_img is None or gray_img.size == 0:
         return [], None
 
     if gray_img.dtype != np.uint8:
@@ -169,31 +195,11 @@ def safe_detect_markers(gray_img, aruco, dictionary, params, detector):
         return corners, ids
 
     except Exception as e:
-        print(f"[WARN] ArUco failed safely: {e}")
+        print(f"[WARN] ArUco detection failed safely: {e}")
         return [], None
 
 
-def resize_for_pi(img, max_width=MAX_WIDTH):
-    h, w = img.shape[:2]
-
-    if w <= max_width:
-        return img
-
-    scale = max_width / float(w)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-
-    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-
 def classify_marker_ids(ids):
-    """
-    Marker meaning:
-        ID 0       -> target
-        ID 1,2,3   -> obstacle
-        anything else ignored
-    """
-
     if ids is None or len(ids) == 0:
         return "E", []
 
@@ -211,16 +217,6 @@ def classify_marker_ids(ids):
 
 
 def update_object_grid_from_heading(object_grid, heading, slot_index, code):
-    """
-    Local object grid:
-
-        row 0: front-left   front   front-right
-        row 1: left         A       right
-        row 2: back-left    back    back-right
-
-    Each scan image sees only its own front row.
-    """
-
     if code == "E":
         return
 
@@ -248,12 +244,11 @@ def update_object_grid_from_heading(object_grid, heading, slot_index, code):
 
 
 # =========================================================
-# STEP 3: DETECT OBJECTS WITH ARUCO
+# STEP 3: DETECT OBJECTS WITH SAFE ARUCO
 # =========================================================
 
 def step3_detect_objects_aruco():
-    print("\nSTEP 3: DETECT OBJECTS WITH ARUCO")
-
+    print("\nSTEP 3: DETECT OBJECTS WITH SAFE ARUCO")
     print("OpenCV version:", cv2.__version__)
     print("Has cv2.aruco:", hasattr(cv2, "aruco"))
 
@@ -274,7 +269,7 @@ def step3_detect_objects_aruco():
         img = cv2.imread(img_path)
 
         if img is None:
-            print(f"[WARN] Could not read {img_path}")
+            print(f"[WARN] Could not read {img_path}. Skipping.")
             detailed_results[heading] = {"error": "image_not_read"}
             continue
 
@@ -286,14 +281,14 @@ def step3_detect_objects_aruco():
         y2 = int(h * ROI_BOT_FRAC)
 
         if y2 <= y1:
-            print(f"[WARN] Bad ROI for {heading}")
+            print(f"[WARN] Bad ROI for {heading}. Skipping.")
             detailed_results[heading] = {"error": "bad_roi"}
             continue
 
         roi = img[y1:y2, :]
 
         if roi.size == 0:
-            print(f"[WARN] Empty ROI for {heading}")
+            print(f"[WARN] Empty ROI for {heading}. Skipping.")
             detailed_results[heading] = {"error": "empty_roi"}
             continue
 
@@ -314,8 +309,6 @@ def step3_detect_objects_aruco():
                 ids_found = []
             else:
                 gray = cv2.cvtColor(slot, cv2.COLOR_BGR2GRAY)
-
-                # Mild blur only
                 gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
                 corners, ids = safe_detect_markers(
@@ -340,7 +333,6 @@ def step3_detect_objects_aruco():
                 "ids": ids_found
             }
 
-            # Debug overlay only saved to file, not displayed
             if code == "T":
                 draw_color = (0, 0, 0)
             elif code == "O":
@@ -348,13 +340,7 @@ def step3_detect_objects_aruco():
             else:
                 draw_color = (0, 255, 0)
 
-            cv2.rectangle(
-                debug_img,
-                (x1, 0),
-                (x2, roi_h - 1),
-                draw_color,
-                2
-            )
+            cv2.rectangle(debug_img, (x1, 0), (x2, roi_h - 1), draw_color, 2)
 
             cv2.putText(
                 debug_img,
@@ -380,9 +366,9 @@ def step3_detect_objects_aruco():
         for row in object_grid:
             f.write(" ".join(row) + "\n")
 
-    json_path = os.path.join(RESULTS_DIR, "object_results.json")
+    object_json_path = os.path.join(RESULTS_DIR, "object_results.json")
 
-    with open(json_path, "w") as f:
+    with open(object_json_path, "w") as f:
         json.dump(
             {
                 "object_grid": object_grid,
@@ -397,7 +383,7 @@ def step3_detect_objects_aruco():
         print(" ".join(row))
 
     print(f"\nSaved object grid: {object_txt_path}")
-    print(f"Saved details: {json_path}")
+    print(f"Saved object details: {object_json_path}")
     print(f"Saved debug images in: {DEBUG_ARUCO_DIR}")
 
     return object_grid
@@ -407,77 +393,29 @@ def step3_detect_objects_aruco():
 # STEP 4: MAP LOCATION
 # =========================================================
 
-def step4_map_location(color_grid, object_grid):
-    """
-    Replace this with your real map_location call.
-
-    The map program should use:
-        color_grid
-        object_grid
-
-    Object detection should NOT be inside the map program.
-    """
+def step4_map_location():
     print("\nSTEP 4: MAP LOCATION")
-    print("Call your existing map_location function here.")
 
-    return {
-        "status": "placeholder",
-        "color_grid": color_grid,
-        "object_grid": object_grid
-    }
+    if os.path.exists(MAP_SCRIPT):
+        run_script(MAP_SCRIPT, "STEP 4: MAP LOCATION")
+    else:
+        print(f"[WARN] {MAP_SCRIPT} not found. Skipping map step.")
 
 
 # =========================================================
-# STEP 5: DETECT ORIENTATION
-# =========================================================
-
-def step5_detect_orientation(map_result):
-    """
-    Replace with your real orientation logic.
-    """
-    print("\nSTEP 5: DETECT ORIENTATION")
-    print("Call your existing orientation logic here.")
-
-    return "U"
-
-
-# =========================================================
-# STEP 6: GENERATE FINAL FILE
-# =========================================================
-
-def step6_generate_final_file(map_result, direction):
-    print("\nSTEP 6: GENERATE FINAL FILE")
-
-    final_path = os.path.join(RESULTS_DIR, "final_result.txt")
-
-    with open(final_path, "w") as f:
-        f.write("FINAL RESULT PLACEHOLDER\n")
-        f.write(f"DIRECTION: {direction}\n")
-        f.write(json.dumps(map_result, indent=2))
-
-    print(f"Saved final result: {final_path}")
-
-
-# =========================================================
-# MAIN RUNNER
+# MAIN
 # =========================================================
 
 def main():
     print("===================================")
     print("PI SENSING RUNNER")
+    print("SAFE ARUCO VERSION")
     print("===================================")
 
     step1_scan()
-
-    color_grid = step2_detect_colors()
-
-    object_grid = step3_detect_objects_aruco()
-
-    map_result = step4_map_location(color_grid, object_grid)
-
-    direction = step5_detect_orientation(map_result)
-
-    step6_generate_final_file(map_result, direction)
+    step2_detect_colors()
+    step3_detect_objects_aruco()
+    step4_map_location()
 
     print("\nDONE.")
 
